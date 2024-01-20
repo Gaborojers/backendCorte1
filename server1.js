@@ -1,15 +1,26 @@
 const express = require('express');
 const http = require('http');
 const socketIO = require('socket.io');
-const WebSocket = require('ws');
 const cors = require('cors');
+const { Sequelize } = require('sequelize');
 
 const app = express();
 const server = http.createServer(app);
 const io = socketIO(server, {
   cors: { origin: '*' },
 });
-const wss = new WebSocket.Server({ noServer: true });
+
+const sequelize = new Sequelize({
+  dialect: 'mysql',
+  host: 'localhost',
+  username: 'root',
+  password: 'LgSc06042004',
+  database: 'servidor',
+  define: {
+    timestamps: true,
+  },
+});
+
 
 const users = new Set();
 const messages = [];
@@ -23,50 +34,55 @@ const onNewUser = (callback) => {
   };
 };
 
+// Define el modelo de mensajes
+const Message = sequelize.define('Message', {
+  username: {
+    type: Sequelize.STRING,
+    allowNull: false,
+  },
+  message: {
+    type: Sequelize.STRING,
+    allowNull: false,
+  },
+});
+
+// Sincroniza el modelo con la base de datos
+sequelize.sync();
+
+// Añadir esta ruta después de la definición de las otras rutas
+app.get('/api/messages', async (req, res) => {
+  try {
+    const allMessages = await Message.findAll();
+    res.json(allMessages);
+  } catch (error) {
+    console.error('Error al obtener mensajes:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+});
+
+
 io.on('connection', (socket) => {
-  socket.emit('messages', messages);
+  // Envia mensajes anteriores al nuevo cliente
+  Message.findAll().then((result) => {
+    socket.emit('messages', result);
+  });
+
   io.emit('userList', Array.from(users));
 
-  socket.on('message', (message) => {
+  socket.on('message', async (message) => {
     const parsedMessage = JSON.parse(message);
-    messages.push(parsedMessage);
+    
+    // Guardar el mensaje en la base de datos
+    await Message.create(parsedMessage);
+
+    // Emitir el mensaje a todos los clientes
     io.emit('message', parsedMessage);
   });
 });
 
-wss.on('connection', (ws) => {
-  ws.send(JSON.stringify({ type: 'messages', data: messages }));
-
-  wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(JSON.stringify({ type: 'userList', data: Array.from(users) }));
-    }
-  });
-
-  ws.on('message', (message) => {
-    const parsedMessage = JSON.parse(message);
-    messages.push(parsedMessage);
-
-    wss.clients.forEach((client) => {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(JSON.stringify({ type: 'message', data: parsedMessage }));
-      }
-    });
-  });
-});
-
-server.on('upgrade', (req, socket, head) => {
-  if (req.url === '/ws') {
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit('connection', ws, req);
-    });
-  }
-});
-
 app.use(cors({
-  origin: '*',
-  allowedHeaders: "Access-Control-Allow-Origin",
-  methods: ['GET', 'POST'],
+  origin: 'http://localhost:3000',  // Ajusta esto según la URL de tu aplicación frontend
+  methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
   credentials: true,
 }));
 
