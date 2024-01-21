@@ -7,7 +7,7 @@ const { Sequelize } = require('sequelize');
 const app = express();
 const server = http.createServer(app);
 const io = socketIO(server, {
-  cors: { origin: '*' },
+  cors: { origin: '*', methods: ['GET', 'POST', 'OPTIONS'] },
 });
 
 const sequelize = new Sequelize({
@@ -21,10 +21,10 @@ const sequelize = new Sequelize({
   },
 });
 
-
 const users = new Set();
 const messages = [];
 const onNewUserCallbacks = new Set();
+let waitingClients = [];
 
 const onNewUser = (callback) => {
   onNewUserCallbacks.add(callback);
@@ -34,7 +34,6 @@ const onNewUser = (callback) => {
   };
 };
 
-// Define el modelo de mensajes
 const Message = sequelize.define('Message', {
   username: {
     type: Sequelize.STRING,
@@ -46,11 +45,29 @@ const Message = sequelize.define('Message', {
   },
 });
 
-// Sincroniza el modelo con la base de datos
 sequelize.sync();
 
-// Añadir esta ruta después de la definición de las otras rutas
-app.get('/api/messages', async (req, res) => {
+// Endpoint para mensajes con long polling
+app.get('/api/waitForMessages', async (req, res) => {
+  try {
+    const waitForMessage = new Promise((resolve) => {
+      waitingClients.push(resolve);
+
+      req.on('close', () => {
+        waitingClients = waitingClients.filter((client) => client !== resolve);
+      });
+    });
+
+    const message = await waitForMessage;
+    res.json(message);
+  } catch (error) {
+    console.error('Error al esperar mensajes:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+});
+
+// Endpoint para mensajes con short polling
+app.get('/api/getMessages', async (req, res) => {
   try {
     const allMessages = await Message.findAll();
     res.json(allMessages);
@@ -60,9 +77,7 @@ app.get('/api/messages', async (req, res) => {
   }
 });
 
-
 io.on('connection', (socket) => {
-  // Envia mensajes anteriores al nuevo cliente
   Message.findAll().then((result) => {
     socket.emit('messages', result);
   });
@@ -71,20 +86,28 @@ io.on('connection', (socket) => {
 
   socket.on('message', async (message) => {
     const parsedMessage = JSON.parse(message);
-    
-    // Guardar el mensaje en la base de datos
+
     await Message.create(parsedMessage);
 
-    // Emitir el mensaje a todos los clientes
     io.emit('message', parsedMessage);
+
+    // Notificar a clientes en espera (long polling)
+    if (waitingClients.length > 0) {
+      const waitingClient = waitingClients.shift();
+      waitingClient(parsedMessage);
+    }
   });
 });
 
-app.use(cors({
-  origin: 'http://localhost:3000',  // Ajusta esto según la URL de tu aplicación frontend
-  methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
-  credentials: true,
-}));
+const corsOptions ={
+    origin:'*',
+    methods: 'GET,POST, OPTIONS',
+    credentials:true,
+    optionSuccessStatus:200
+}
+app.use(cors(corsOptions));
+
+io.use(cors());
 
 app.get('/api/users', (req, res) => {
   res.json(Array.from(users));
