@@ -7,7 +7,7 @@ const { Sequelize } = require('sequelize');
 const app = express();
 const server = http.createServer(app);
 const io = socketIO(server, {
-  cors: { origin: '*', methods: ['GET', 'POST', 'OPTIONS'] },
+  cors: { origin: '*' },
 });
 
 const sequelize = new Sequelize({
@@ -106,8 +106,6 @@ const corsOptions ={
     optionSuccessStatus:200
 }
 app.use(cors(corsOptions));
-
-io.use(cors());
 
 app.get('/api/users', (req, res) => {
   res.json(Array.from(users));
