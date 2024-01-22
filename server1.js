@@ -101,7 +101,7 @@ io.on('connection', (socket) => {
 
 const corsOptions ={
     origin:'*',
-    methods: 'GET,POST, OPTIONS',
+    methods: 'GET,POST',
     credentials:true,
     optionSuccessStatus:200
 }
