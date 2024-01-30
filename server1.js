@@ -1,14 +1,20 @@
 const express = require('express');
 const http = require('http');
-const socketIO = require('socket.io');
+const WebSocket = require('ws');
 const cors = require('cors');
 const { Sequelize } = require('sequelize');
+const bodyParser = require('body-parser');
 
 const app = express();
+
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(cors());
+
 const server = http.createServer(app);
-const io = socketIO(server, {
-  cors: { origin: '*' },
-});
+const wss = new WebSocket.Server({ noServer: true });
+
+const onNewUserCallbacks = new Set();
 
 const sequelize = new Sequelize({
   dialect: 'mysql',
@@ -21,19 +27,6 @@ const sequelize = new Sequelize({
   },
 });
 
-const users = new Set();
-const messages = [];
-const onNewUserCallbacks = new Set();
-let waitingClients = [];
-
-const onNewUser = (callback) => {
-  onNewUserCallbacks.add(callback);
-
-  return () => {
-    onNewUserCallbacks.delete(callback);
-  };
-};
-
 const Message = sequelize.define('Message', {
   username: {
     type: Sequelize.STRING,
@@ -45,16 +38,104 @@ const Message = sequelize.define('Message', {
   },
 });
 
-sequelize.sync();
+sequelize.sync()
+  .then(() => {
+    console.log('Conexión a la base de datos establecida y sincronizada');
+  })
+  .catch((error) => {
+    console.error('Error al sincronizar con la base de datos:', error);
+  });
 
-// Endpoint para mensajes con long polling
+let onlineUsers = 0;
+let registeredUsers = 0;
+
+//WebSocket
+wss.on('connection', (socket) => {
+  onlineUsers++;
+  broadcastOnlineUsers();
+
+  socket.on('close', () => {
+    onlineUsers--;
+    broadcastOnlineUsers();
+  });
+
+  function broadcastOnlineUsers() {
+    broadcastToClients({ event: 'onlineUsers', data: onlineUsers });
+  }
+
+  const sendBuffer = [];
+  const send = (data) => {
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(data));
+    } else {
+      sendBuffer.push(data);
+    }
+  };
+
+  socket.on('open', () => {
+    sendBuffer.forEach((data) => send(data));
+    sendBuffer.length = 0;
+
+    console.log('WebSocket reconectado');
+  });
+
+  send({ event: 'test', data: 'This is a test message' });
+
+  Message.findAll().then((result) => {
+    send({ event: 'messages', data: result });
+  });
+
+  socket.on('message', async (message) => {
+    try {
+      const parsedMessage = JSON.parse(message);
+      await Message.create(parsedMessage);
+      broadcastToClients({ event: 'message', data: parsedMessage });
+    } catch (error) {
+      console.error('Error al procesar y guardar el mensaje:', error);
+    }
+  });
+});
+
+//Short polling - Contador de usuarios en línea
+app.get('/api/onlineUsers', (req, res) => {
+  try {
+    res.json({ onlineUsers });
+  } catch (error) {
+    console.error('Error al obtener la cantidad de usuarios en línea:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+});
+
+const waitingClients = [];
+
+//Long polling - Contador de usuarios registrados
+app.get('/api/registeredUsers', async (req, res) => {
+  try {
+    const count = await User.count();
+
+    // Agregar un encabezado personalizado
+    res.setHeader('X-Endpoint-Name', 'registeredUsers');
+    res.json({ registeredUsers: count });
+  } catch (error) {
+    console.error('Error al obtener la cantidad de usuarios registrados:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  } finally {
+    // Configurar un límite de tiempo de espera (por ejemplo, 30 segundos)
+    setTimeout(() => {
+      if (!res.headersSent) {
+        res.json({ registeredUsers: 0 }); // O enviar una respuesta vacía
+      }
+    }, 2000); // 2 segundos
+  }
+});
+
 app.get('/api/waitForMessages', async (req, res) => {
   try {
     const waitForMessage = new Promise((resolve) => {
       waitingClients.push(resolve);
 
       req.on('close', () => {
-        waitingClients = waitingClients.filter((client) => client !== resolve);
+        waitingClients.splice(waitingClients.indexOf(resolve), 1);
       });
     });
 
@@ -66,36 +147,17 @@ app.get('/api/waitForMessages', async (req, res) => {
   }
 });
 
-// Endpoint para mensajes con short polling
-app.get('/api/getMessages', async (req, res) => {
-  try {
-    const allMessages = await Message.findAll();
-    res.json(allMessages);
-  } catch (error) {
-    console.error('Error al obtener mensajes:', error);
-    res.status(500).json({ error: 'Error interno del servidor' });
-  }
-});
-
-io.on('connection', (socket) => {
-  Message.findAll().then((result) => {
-    socket.emit('messages', result);
-  });
-
-  io.emit('userList', Array.from(users));
-
-  socket.on('message', async (message) => {
-    const parsedMessage = JSON.parse(message);
-
-    await Message.create(parsedMessage);
-
-    io.emit('message', parsedMessage);
-
-    // Notificar a clientes en espera (long polling)
-    if (waitingClients.length > 0) {
-      const waitingClient = waitingClients.shift();
-      waitingClient(parsedMessage);
+function broadcastToClients(message) {
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify(message));
     }
+  });
+}
+
+server.on('upgrade', (request, socket, head) => {
+  wss.handleUpgrade(request, socket, head, (socket) => {
+    wss.emit('connection', socket, request);
   });
 });
 
@@ -123,6 +185,58 @@ app.get('/api/waitForEvents', (req, res) => {
   };
 
   req.on('close', handleDisconnect);
+});
+
+const User = sequelize.define('User', {
+  username: {
+    type: Sequelize.STRING,
+    allowNull: false,
+  },
+  password: {
+    type: Sequelize.STRING,
+    allowNull: false,
+  },
+}, {
+  timestamps: false, // Desactiva la generación automática de campos createdAt y updatedAt
+});
+
+// Agregar una nueva ruta para el registro de usuarios
+app.post('/api/register', async (req, res) => {
+  const { username, password } = req.body;
+
+  try {
+    // Verificar si el usuario ya existe en la base de datos
+    const existingUser = await User.findOne({ where: { username } });
+
+    if (existingUser) {
+      res.status(400).json({ error: 'El nombre de usuario ya está en uso' });
+    } else {
+      // Crear un nuevo usuario en la base de datos
+      const newUser = await User.create({ username, password });
+      res.json({ success: true, user: newUser });
+    }
+  } catch (error) {
+    console.error('Error al registrar usuario:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+});
+
+app.post('/api/login', async (req, res) => {
+  const { username, password } = req.body;
+
+  try {
+    // Buscar el usuario en la base de datos
+    const user = await User.findOne({ where: { username, password } });
+
+    if (user) {
+      res.json({ success: true });
+    } else {
+      res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+    }
+  } catch (error) {
+    console.error('Error al autenticar usuario:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
 });
 
 setTimeout(() => {
