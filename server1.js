@@ -79,7 +79,6 @@ wss.on('connection', (socket) => {
     console.log('WebSocket reconectado');
   });
 
-  send({ event: 'test', data: 'This is a test message' });
 
   Message.findAll().then((result) => {
     send({ event: 'messages', data: result });
@@ -108,24 +107,39 @@ app.get('/api/onlineUsers', (req, res) => {
 
 const waitingClients = [];
 
-//Long polling - Contador de usuarios registrados
+// Long polling - Contador de usuarios registrados
 app.get('/api/registeredUsers', async (req, res) => {
   try {
     const count = await User.count();
-
-    // Agregar un encabezado personalizado
-    res.setHeader('X-Endpoint-Name', 'registeredUsers');
     res.json({ registeredUsers: count });
+    
+    // Resolver las promesas y enviar el nuevo recuento de registeredUsers
+    waitingClients.forEach((resolve) => {
+      resolve({ registeredUsers: count });
+    });
+
+    // Limpiar el conjunto después de resolver las promesas
+    waitingClients.length = 0;
   } catch (error) {
     console.error('Error al obtener la cantidad de usuarios registrados:', error);
     res.status(500).json({ error: 'Error interno del servidor' });
-  } finally {
-    // Configurar un límite de tiempo de espera (por ejemplo, 30 segundos)
-    setTimeout(() => {
-      if (!res.headersSent) {
-        res.json({ registeredUsers: 0 }); // O enviar una respuesta vacía
-      }
-    }, 2000); // 2 segundos
+  }
+});
+app.get('/api/waitForRegisteredUsers', async (req, res) => {
+  try {
+    const waitForRegisteredUsers = new Promise((resolve) => {
+      waitingClients.push(resolve);
+
+      req.on('close', () => {
+        waitingClients.splice(waitingClients.indexOf(resolve), 1);
+      });
+    });
+
+    const result = await waitForRegisteredUsers;
+    res.json(result);
+  } catch (error) {
+    console.error('Error al esperar usuarios registrados:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
   }
 });
 
@@ -213,6 +227,13 @@ app.post('/api/register', async (req, res) => {
     } else {
       // Crear un nuevo usuario en la base de datos
       const newUser = await User.create({ username, password });
+
+      // Incrementar el contador de usuarios registrados
+      registeredUsers++;
+      
+      // Notificar a los clientes WebSocket sobre el cambio
+      broadcastToClients({ event: 'updateRegisteredUsers' });
+
       res.json({ success: true, user: newUser });
     }
   } catch (error) {
